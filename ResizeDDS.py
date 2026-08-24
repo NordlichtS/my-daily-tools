@@ -54,6 +54,9 @@ SRGB_TO_LINEAR_DXGI = {
     "B8G8R8X8_UNORM_SRGB": (93, 88),
     "BC7_UNORM_SRGB": (99, 98),
 }
+LINEAR_TO_SRGB_FORMAT = {
+    srgb_format.removesuffix("_SRGB"): srgb_format for srgb_format in SRGB_TO_LINEAR_DXGI
+}
 
 
 @dataclass(frozen=True)
@@ -160,12 +163,14 @@ class SRGBMode(IntEnum):
     PRESERVE = 0
     ASSUME_LINEAR = 1
     CONVERT_TO_LINEAR = 2
+    FORCE_SRGB_TAG = 3
 
 
 class ColorAction(IntEnum):
     NONE = 0
     REINTERPRET_LINEAR = 1
     CONVERT_TO_LINEAR = 2
+    ASSUME_SRGB = 3
 
 
 class SwizzleMode(IntEnum):
@@ -311,13 +316,30 @@ class BatchProgress:
         self.failed = 0
         self._width = 0
 
+    @staticmethod
+    def _fit_to_console(prefix: str, current: Path) -> str:
+        # Leave the final console column unused: writing into it can trigger an
+        # automatic wrap before the following carriage return is processed.
+        console_width = max(1, shutil.get_terminal_size(fallback=(120, 24)).columns - 1)
+        path_text = str(current)
+        available = console_width - len(prefix)
+        if available <= 0:
+            return prefix[:console_width]
+        if len(path_text) > available:
+            if available > 3:
+                path_text = "..." + path_text[-(available - 3) :]
+            else:
+                path_text = path_text[-available:]
+        return prefix + path_text
+
     def update(self, current: Path) -> None:
-        text = (
-            f"total {self.total} , converted {self.converted}, failed {self.failed} , "
-            f"current >> {current}"
+        prefix = (
+            f"total {self.total} , converted {self.converted}, failed {self.failed} , current >> "
         )
-        self._width = max(self._width, len(text))
-        sys.stdout.write("\r" + text.ljust(self._width))
+        text = self._fit_to_console(prefix, current)
+        previous_width = self._width
+        self._width = len(text)
+        sys.stdout.write("\r" + text + (" " * max(0, previous_width - len(text))) + "\r")
         sys.stdout.flush()
 
     def success(self, current: Path) -> None:
@@ -628,11 +650,12 @@ def prompt_srgb_mode() -> int:
     print("  0 = Preserve each source's sRGB or linear classification")
     print("  1 = Treat every source as linear without converting its stored color values")
     print("  2 = Convert sRGB color values to linear; write linear output for every source")
+    print("  3 = Assume input values are sRGB and write sRGB output (not applicable to BC4/5/6)")
     while True:
-        raw = input("Choose 0, 1, or 2: ").strip()
-        if raw in {"0", "1", "2"}:
+        raw = input("Choose 0, 1, 2, or 3: ").strip()
+        if raw in {"0", "1", "2", "3"}:
             return int(raw)
-        print("Enter 0, 1, or 2.")
+        print("Enter 0, 1, 2, or 3.")
 
 
 def prompt_mipmap_mode() -> int:
@@ -711,16 +734,24 @@ def is_bc1_format(target_format: str) -> bool:
 
 
 def output_format(compression: int, source_metadata: TextureMetadata, srgb_mode: int) -> str:
-    output_is_srgb = source_metadata.is_srgb and srgb_mode == 0
+    output_is_srgb = (source_metadata.is_srgb and srgb_mode == SRGBMode.PRESERVE) or (
+        srgb_mode == SRGBMode.FORCE_SRGB_TAG
+    )
     if compression == 0:
-        return source_metadata.format if output_is_srgb else source_metadata.format.removesuffix("_SRGB")
+        linear_format = source_metadata.format.removesuffix("_SRGB")
+        if linear_format.startswith(("BC4_", "BC5_", "BC6")):
+            return linear_format
+        if output_is_srgb:
+            try:
+                return LINEAR_TO_SRGB_FORMAT[linear_format]
+            except KeyError as exc:
+                raise RuntimeError(f"{linear_format} has no sRGB DXGI variant") from exc
+        return linear_format
     if compression == 8:
         return "R8G8B8A8_UNORM_SRGB" if output_is_srgb else "R8G8B8A8_UNORM"
     if compression in {1, 2, 3, 7}:
         suffix = "_UNORM_SRGB" if output_is_srgb else "_UNORM"
         return f"BC{compression}{suffix}"
-    if output_is_srgb:
-        raise RuntimeError(f"BC{compression} has no sRGB DXGI format, so the sRGB label cannot be preserved")
     if compression == 4:
         return "BC4_UNORM"
     if compression == 5:
@@ -843,6 +874,12 @@ def resolve_file_state(state: FileState, options: UserOptions) -> None:
         state.reason = str(exc)
         return
 
+    if options.srgb_mode == SRGBMode.FORCE_SRGB_TAG:
+        if target_format.startswith(("BC4_", "BC5_", "BC6")):
+            state.notes.append(f"{target_format} has no sRGB tag; mode 3 does not apply")
+        else:
+            color_action = ColorAction.ASSUME_SRGB
+
     state.slots[Slot.OUTPUT_FORMAT] = format_code(target_format)
     state.slots[Slot.OUTPUT_SRGB] = int(target_format.endswith("_SRGB"))
     state.slots[Slot.COLOR_ACTION] = int(color_action)
@@ -916,12 +953,14 @@ def validate_resolved_state(state: FileState) -> list[str]:
     except ValueError:
         problems.append(f"unknown color action {state.slots[Slot.COLOR_ACTION]}")
         color_action = ColorAction.NONE
-    if color_action != ColorAction.NONE and not metadata.is_srgb:
+    if color_action in {ColorAction.REINTERPRET_LINEAR, ColorAction.CONVERT_TO_LINEAR} and not metadata.is_srgb:
         problems.append("linearization was requested for an already-linear source")
-    if color_action != ColorAction.NONE and state.slots[Slot.OUTPUT_SRGB]:
+    if color_action in {ColorAction.REINTERPRET_LINEAR, ColorAction.CONVERT_TO_LINEAR} and state.slots[Slot.OUTPUT_SRGB]:
         problems.append("linearization cannot produce an sRGB-labelled output")
     if color_action == ColorAction.REINTERPRET_LINEAR and metadata.format not in SRGB_TO_LINEAR_DXGI:
         problems.append(f"{metadata.format} cannot be reinterpreted by patching its DX10 format tag")
+    if color_action == ColorAction.ASSUME_SRGB and not state.slots[Slot.OUTPUT_SRGB]:
+        problems.append("sRGB input/output handling requires an sRGB-labelled output format")
 
     try:
         swizzle = SwizzleMode(state.slots[Slot.SWIZZLE])
@@ -986,6 +1025,8 @@ def build_texconv_command(
     ]
     if ColorAction(state.slots[Slot.COLOR_ACTION]) == ColorAction.CONVERT_TO_LINEAR:
         command.append("-srgbi")
+    elif ColorAction(state.slots[Slot.COLOR_ACTION]) == ColorAction.ASSUME_SRGB:
+        command.append("-srgb")
     swizzle = SwizzleMode(state.slots[Slot.SWIZZLE])
     swizzle_value = {
         SwizzleMode.RGB1: "rgb1",
