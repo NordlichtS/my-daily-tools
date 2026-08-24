@@ -15,6 +15,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from enum import IntEnum, IntFlag
 from pathlib import Path
 from typing import Iterable
 
@@ -26,7 +27,6 @@ for _stream in (sys.stdout, sys.stderr):
 
 MIN_SIZE = 32
 MAX_SIZE = 8192
-RESTART_REQUESTED = 1000
 METADATA_KEYS = {
     "width": "width",
     "height": "height",
@@ -44,6 +44,7 @@ ALPHA_MODE_VALUES = {
     "Opaque": 3,
     "Custom": 4,
 }
+ALPHA_MODE_NAMES = {value: name for name, value in ALPHA_MODE_VALUES.items()}
 SRGB_TO_LINEAR_DXGI = {
     "R8G8B8A8_UNORM_SRGB": (29, 28),
     "BC1_UNORM_SRGB": (72, 71),
@@ -79,21 +80,219 @@ class TextureJob:
     output_metadata: TextureMetadata
 
 
+UNSET = -1
+
+
+class FileStatus(IntEnum):
+    ACTIVE = 0
+    POLICY_SKIPPED = 1
+    INVALID_COMBINATION = 2
+    CONVERSION_FAILED = 3
+    STAGED = 4
+    KEPT_STAGING = 5
+    INSTALLED = 6
+    INSTALL_FAILED = 7
+    INSPECTION_FAILED = 8
+
+
+class Slot(IntEnum):
+    STATUS = 0
+    IS_NORMAL = 1
+    SOURCE_WIDTH = 2
+    SOURCE_HEIGHT = 3
+    SOURCE_DEPTH = 4
+    SOURCE_MIPS = 5
+    SOURCE_ARRAY_SIZE = 6
+    SOURCE_FORMAT = 7
+    SOURCE_SRGB = 8
+    SOURCE_ALPHA_MODE = 9
+    SOURCE_DIMENSION = 10
+    REQUEST_TARGET_SIZE = 11
+    REQUEST_NON_SQUARE = 12
+    REQUEST_SMALL = 13
+    REQUEST_COMPRESSION = 14
+    REQUEST_NORMAL = 15
+    REQUEST_BC1_ALPHA = 16
+    REQUEST_SRGB = 17
+    REQUEST_MIPS = 18
+    OUTPUT_WIDTH = 19
+    OUTPUT_HEIGHT = 20
+    OUTPUT_FORMAT = 21
+    OUTPUT_SRGB = 22
+    COLOR_ACTION = 23
+    SWIZZLE = 24
+    BC_FLAGS = 25
+    ALPHA_THRESHOLD = 26
+    TEXCONV_MIPS = 27
+    EXPECTED_MIPS = 28
+    EXPECTED_ALPHA_MODE = 29
+    COUNT = 30
+
+
+class CompressionChoice(IntEnum):
+    PRESERVE = 0
+    BC1 = 1
+    BC2 = 2
+    BC3 = 3
+    BC4 = 4
+    BC5 = 5
+    BC6H = 6
+    BC7 = 7
+    RGBA8888 = 8
+
+
+class NormalTreatment(IntEnum):
+    NONE = 0
+    FORCE_BLUE = 1
+    FORCE_BC5 = 2
+
+
+class BC1AlphaTreatment(IntEnum):
+    NOT_APPLICABLE = -1
+    OPAQUE = 0
+    THRESHOLD_025 = 1
+    THRESHOLD_050 = 2
+    THRESHOLD_075 = 3
+    DITHER = 4
+
+
+class SRGBMode(IntEnum):
+    PRESERVE = 0
+    ASSUME_LINEAR = 1
+    CONVERT_TO_LINEAR = 2
+
+
+class ColorAction(IntEnum):
+    NONE = 0
+    REINTERPRET_LINEAR = 1
+    CONVERT_TO_LINEAR = 2
+
+
+class SwizzleMode(IntEnum):
+    NONE = 0
+    RGB1 = 1
+    RG1A = 2
+    RG11 = 3
+
+
+class BCFlag(IntFlag):
+    NONE = 0
+    UNIFORM = 1
+    DITHER = 2
+
+
+class AlphaThreshold(IntEnum):
+    NONE = 0
+    VALUE_025 = 25
+    VALUE_050 = 50
+    VALUE_075 = 75
+
+
 @dataclass(frozen=True)
-class PlannedTexture:
-    source: Path
-    source_metadata: TextureMetadata
-    output_width: int
-    output_height: int
-    target_format: str
+class UserOptions:
+    target_size: int
+    non_square_policy: int
+    small_policy: int
+    compression: CompressionChoice
+    normal_treatment: NormalTreatment
+    bc1_alpha: BC1AlphaTreatment
+    srgb_mode: SRGBMode
+    mip_mode: int
+
+
+@dataclass
+class FileState:
+    path: Path
+    metadata: TextureMetadata | None
+    slots: list[int]
+    notes: list[str]
+    reason: str = ""
+    staged: Path | None = None
+    output_metadata: TextureMetadata | None = None
+
+    @property
+    def status(self) -> FileStatus:
+        return FileStatus(self.slots[Slot.STATUS])
+
+    @status.setter
+    def status(self, value: FileStatus) -> None:
+        self.slots[Slot.STATUS] = int(value)
+
+
+FORMAT_TO_CODE: dict[str, int] = {}
+CODE_TO_FORMAT: list[str] = []
+DIMENSION_TO_CODE: dict[str, int] = {}
+CODE_TO_DIMENSION: list[str] = []
+
+REQUEST_SLOTS = tuple(Slot(index) for index in range(Slot.REQUEST_TARGET_SIZE, Slot.OUTPUT_WIDTH))
+RESOLVED_SLOTS = tuple(Slot(index) for index in range(Slot.OUTPUT_WIDTH, Slot.COUNT))
+
+
+def intern_value(value: str, lookup: dict[str, int], values: list[str]) -> int:
+    normalized = value.upper()
+    code = lookup.get(normalized)
+    if code is None:
+        code = len(values)
+        lookup[normalized] = code
+        values.append(normalized)
+    return code
+
+
+def format_code(value: str) -> int:
+    return intern_value(value, FORMAT_TO_CODE, CODE_TO_FORMAT)
+
+
+def format_name(code: int) -> str:
+    if code < 0 or code >= len(CODE_TO_FORMAT):
+        raise RuntimeError(f"invalid format code {code}")
+    return CODE_TO_FORMAT[code]
+
+
+def dimension_code(value: str) -> int:
+    return intern_value(value, DIMENSION_TO_CODE, CODE_TO_DIMENSION)
+
+
+def create_file_state(path: Path, metadata: TextureMetadata | None, error: str = "") -> FileState:
+    slots = [UNSET] * int(Slot.COUNT)
+    slots[Slot.STATUS] = int(FileStatus.ACTIVE if metadata else FileStatus.INSPECTION_FAILED)
+    state = FileState(path=path, metadata=metadata, slots=slots, notes=[], reason=error)
+    if metadata is None:
+        return state
+    slots[Slot.IS_NORMAL] = int(is_normal_texture(path))
+    slots[Slot.SOURCE_WIDTH] = metadata.width
+    slots[Slot.SOURCE_HEIGHT] = metadata.height
+    slots[Slot.SOURCE_DEPTH] = metadata.depth
+    slots[Slot.SOURCE_MIPS] = metadata.mip_levels
+    slots[Slot.SOURCE_ARRAY_SIZE] = metadata.array_size
+    slots[Slot.SOURCE_FORMAT] = format_code(metadata.format)
+    slots[Slot.SOURCE_SRGB] = int(metadata.is_srgb)
+    slots[Slot.SOURCE_ALPHA_MODE] = ALPHA_MODE_VALUES[metadata.alpha_mode]
+    slots[Slot.SOURCE_DIMENSION] = dimension_code(metadata.dimension)
+    return state
+
+
+def clear_round_slots(state: FileState) -> None:
+    for slot in REQUEST_SLOTS + RESOLVED_SLOTS:
+        state.slots[slot] = UNSET
+    state.notes.clear()
+    state.reason = ""
+    state.staged = None
+    state.output_metadata = None
+
+
+def reset_for_retry(state: FileState) -> None:
+    clear_round_slots(state)
+    state.status = FileStatus.ACTIVE
 
 
 class RunLog:
-    def __init__(self) -> None:
+    def __init__(self, console: bool = True) -> None:
         self.lines: list[str] = []
+        self.console = console
 
     def write(self, message: str = "") -> None:
-        print(message)
+        if self.console:
+            print(message, flush=True)
         self.lines.append(message)
 
     def save_to(self, staging_directories: Iterable[Path]) -> None:
@@ -103,6 +302,36 @@ class RunLog:
                 (directory / "ResizeDDS.log").write_text(text, encoding="utf-8")
             except OSError as exc:
                 print(f"[WARNING] Could not write log in {directory}: {exc}")
+
+
+class BatchProgress:
+    def __init__(self, total: int) -> None:
+        self.total = total
+        self.converted = 0
+        self.failed = 0
+        self._width = 0
+
+    def update(self, current: Path) -> None:
+        text = (
+            f"total {self.total} , converted {self.converted}, failed {self.failed} , "
+            f"current >> {current}"
+        )
+        self._width = max(self._width, len(text))
+        sys.stdout.write("\r" + text.ljust(self._width))
+        sys.stdout.flush()
+
+    def success(self, current: Path) -> None:
+        self.converted += 1
+        self.update(current)
+
+    def failure(self, current: Path) -> None:
+        self.failed += 1
+        self.update(current)
+
+    def finish(self) -> None:
+        if self.total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 def find_directxtex_tool(name: str) -> Path:
@@ -184,6 +413,30 @@ def read_metadata(texdiag: Path, texture: Path) -> TextureMetadata:
         )
     except ValueError as exc:
         raise RuntimeError(f"Could not parse texdiag numeric metadata: {exc}") from exc
+
+
+def is_dds_cubemap(texture: Path) -> bool:
+    try:
+        with texture.open("rb") as stream:
+            header = stream.read(116)
+    except OSError as exc:
+        raise RuntimeError(f"could not read DDS header: {exc}") from exc
+    if len(header) < 116 or header[:4] != b"DDS ":
+        raise RuntimeError("file does not contain a valid DDS header")
+    caps2 = struct.unpack_from("<I", header, 112)[0]
+    return bool(caps2 & 0x200)
+
+
+def unsupported_texture_shape(texture: Path, metadata: TextureMetadata) -> str | None:
+    if is_dds_cubemap(texture):
+        return "cubemaps are not supported; only ordinary 2D textures are accepted"
+    if metadata.array_size != 1:
+        return f"texture arrays are not supported (array size {metadata.array_size})"
+    if metadata.depth != 1:
+        return f"volume textures are not supported (depth {metadata.depth})"
+    if metadata.dimension.upper() not in {"2D", "TEXTURE2D"}:
+        return f"{metadata.dimension} textures are not supported; only 2D textures are accepted"
+    return None
 
 
 def split_windows_input(raw: str) -> list[str]:
@@ -321,6 +574,55 @@ def prompt_compression() -> int:
         print("Invalid compression choice. Enter a number from 0 through 8.")
 
 
+def prompt_bc1_transparency() -> int:
+    print("\nBC1 transparency treatment:")
+    print("  0 = Force every pixel opaque; do not retain transparency")
+    print("  1 = Binary transparency with alpha threshold 0.25")
+    print("  2 = Binary transparency with alpha threshold 0.50")
+    print("  3 = Binary transparency with alpha threshold 0.75")
+    print("  4 = Dither the full 0.0-1.0 alpha range into transparent/opaque coverage")
+    while True:
+        raw = input("Choose 0 through 4: ").strip()
+        if raw in {"0", "1", "2", "3", "4"}:
+            return int(raw)
+        print("Enter a number from 0 through 4.")
+
+
+def prompt_normal_texture_treatment() -> int:
+    print("\nSpecial treatment for files with 'normal' in the filename:")
+    print("  0 = No special treatment")
+    print("  1 = Force the blue channel to 1.0")
+    print("  2 = Change the output format to BC5_UNORM")
+    while True:
+        raw = input("Choose 0, 1, or 2: ").strip()
+        if raw in {"0", "1", "2"}:
+            return int(raw)
+        print("Enter 0, 1, or 2.")
+
+
+def normal_texture_treatment_label(mode: int) -> str:
+    return {
+        0: "none",
+        1: "force blue to 1.0",
+        2: "override output format with BC5_UNORM",
+    }[mode]
+
+
+def is_normal_texture(path: Path) -> bool:
+    return "normal" in path.name.casefold()
+
+
+def bc1_transparency_label(mode: int | None) -> str:
+    return {
+        None: "not applicable",
+        0: "force opaque",
+        1: "threshold 0.25",
+        2: "threshold 0.50",
+        3: "threshold 0.75",
+        4: "full-range alpha dithering",
+    }[mode]
+
+
 def prompt_srgb_mode() -> int:
     print("\nsRGB handling:")
     print("  0 = Preserve each source's sRGB or linear classification")
@@ -336,13 +638,48 @@ def prompt_srgb_mode() -> int:
 def prompt_mipmap_mode() -> int:
     print("\nMipmap mode:")
     print("  0 = Keep single-mip sources single; regenerate a full chain for sources with mipmaps")
-    print("  1 = Always generate a full mip chain")
-    print("  2 = Top level only; remove mip chains")
+    print("  1 = Keep only the biggest (top) mip level")
+    print("  2 = Always generate a full mip chain")
     while True:
         raw = input("Choose 0, 1, or 2: ").strip()
         if raw in {"0", "1", "2"}:
             return int(raw)
         print("Enter 0, 1, or 2.")
+
+
+def prompt_user_options() -> UserOptions:
+    target_size = prompt_resolution()
+    non_square_policy = prompt_non_square_policy(target_size)
+    small_policy = prompt_small_texture_policy()
+    compression = CompressionChoice(prompt_compression())
+    normal_treatment = NormalTreatment(prompt_normal_texture_treatment())
+    bc1_alpha = (
+        BC1AlphaTreatment(prompt_bc1_transparency())
+        if compression == CompressionChoice.BC1
+        else BC1AlphaTreatment.NOT_APPLICABLE
+    )
+    srgb_mode = SRGBMode(prompt_srgb_mode())
+    mip_mode = prompt_mipmap_mode()
+    return UserOptions(
+        target_size=target_size,
+        non_square_policy=non_square_policy,
+        small_policy=small_policy,
+        compression=compression,
+        normal_treatment=normal_treatment,
+        bc1_alpha=bc1_alpha,
+        srgb_mode=srgb_mode,
+        mip_mode=mip_mode,
+    )
+
+
+def prompt_retry_leftovers() -> bool:
+    while True:
+        raw = input("Enter 1 to retry these files with new options, or 0 to finish: ").strip()
+        if raw == "1":
+            return True
+        if raw == "0":
+            return False
+        print("Enter 1 to retry or 0 to finish.")
 
 
 def compression_label(compression: int) -> str:
@@ -368,6 +705,11 @@ def supports_uniform_bc_weighting(target_format: str) -> bool:
     }
 
 
+def is_bc1_format(target_format: str) -> bool:
+    normalized = target_format.upper()
+    return normalized.startswith("BC1_") or normalized == "DXT1"
+
+
 def output_format(compression: int, source_metadata: TextureMetadata, srgb_mode: int) -> str:
     output_is_srgb = source_metadata.is_srgb and srgb_mode == 0
     if compression == 0:
@@ -390,16 +732,16 @@ def output_format(compression: int, source_metadata: TextureMetadata, srgb_mode:
 
 def mip_argument(mode: int, source_metadata: TextureMetadata) -> int:
     if mode == 1:
-        return 0
-    if mode == 2:
         return 1
+    if mode == 2:
+        return 0
     return 1 if source_metadata.mip_levels == 1 else 0
 
 
 def expected_mip_levels(
     mode: int, source_metadata: TextureMetadata, output_width: int, output_height: int
 ) -> int:
-    if mode == 2 or (mode == 0 and source_metadata.mip_levels == 1):
+    if mode == 1 or (mode == 0 and source_metadata.mip_levels == 1):
         return 1
     return int(math.floor(math.log2(max(output_width, output_height, source_metadata.depth)))) + 1
 
@@ -429,6 +771,243 @@ def floor_power_of_two(value: int) -> int:
     if value < 1:
         raise ValueError("texture dimensions must be positive")
     return 1 << (value.bit_length() - 1)
+
+
+def format_stores_blue(target_format: str) -> bool:
+    normalized = target_format.upper()
+    if normalized.startswith(("BC4_", "BC5_")):
+        return False
+    return not normalized.startswith(("R8_", "R8G8_", "R16_", "R16G16_", "R32_", "R32G32_", "A8_"))
+
+
+def write_user_requests(state: FileState, options: UserOptions) -> None:
+    state.slots[Slot.REQUEST_TARGET_SIZE] = options.target_size
+    state.slots[Slot.REQUEST_NON_SQUARE] = options.non_square_policy
+    state.slots[Slot.REQUEST_SMALL] = options.small_policy
+    state.slots[Slot.REQUEST_COMPRESSION] = int(options.compression)
+    state.slots[Slot.REQUEST_NORMAL] = int(options.normal_treatment)
+    state.slots[Slot.REQUEST_BC1_ALPHA] = int(options.bc1_alpha)
+    state.slots[Slot.REQUEST_SRGB] = int(options.srgb_mode)
+    state.slots[Slot.REQUEST_MIPS] = options.mip_mode
+
+
+def resolve_file_state(state: FileState, options: UserOptions) -> None:
+    if state.metadata is None:
+        return
+    clear_round_slots(state)
+    state.status = FileStatus.ACTIVE
+    write_user_requests(state, options)
+    metadata = state.metadata
+
+    is_non_square = metadata.width != metadata.height
+    if is_non_square and options.non_square_policy == 0:
+        state.status = FileStatus.POLICY_SKIPPED
+        state.reason = "non-square source and non-square policy is 0"
+        return
+    is_small_or_equal = (
+        options.target_size != 0
+        and metadata.width <= options.target_size
+        and metadata.height <= options.target_size
+    )
+    if not is_non_square and is_small_or_equal and options.small_policy == 0:
+        state.status = FileStatus.POLICY_SKIPPED
+        state.reason = "at or below the target and smaller/equal policy is 0"
+        return
+
+    output_width, output_height = planned_dimensions(
+        metadata, options.target_size, options.small_policy, options.non_square_policy
+    )
+    state.slots[Slot.OUTPUT_WIDTH] = output_width
+    state.slots[Slot.OUTPUT_HEIGHT] = output_height
+
+    normal_match = bool(state.slots[Slot.IS_NORMAL])
+    normal_bc5_override = normal_match and options.normal_treatment == NormalTreatment.FORCE_BC5
+    effective_compression = CompressionChoice.BC5 if normal_bc5_override else options.compression
+
+    color_action = ColorAction.NONE
+    format_srgb_mode = options.srgb_mode
+    if metadata.is_srgb:
+        if normal_bc5_override and options.srgb_mode == SRGBMode.PRESERVE:
+            color_action = ColorAction.REINTERPRET_LINEAR
+            format_srgb_mode = SRGBMode.ASSUME_LINEAR
+            state.notes.append("sRGB normal overridden to BC5: stored values are reinterpreted as linear")
+        elif options.srgb_mode == SRGBMode.ASSUME_LINEAR:
+            color_action = ColorAction.REINTERPRET_LINEAR
+        elif options.srgb_mode == SRGBMode.CONVERT_TO_LINEAR:
+            color_action = ColorAction.CONVERT_TO_LINEAR
+
+    try:
+        target_format = output_format(int(effective_compression), metadata, int(format_srgb_mode))
+    except RuntimeError as exc:
+        state.status = FileStatus.INVALID_COMBINATION
+        state.reason = str(exc)
+        return
+
+    state.slots[Slot.OUTPUT_FORMAT] = format_code(target_format)
+    state.slots[Slot.OUTPUT_SRGB] = int(target_format.endswith("_SRGB"))
+    state.slots[Slot.COLOR_ACTION] = int(color_action)
+
+    force_blue = normal_match and options.normal_treatment == NormalTreatment.FORCE_BLUE
+    if force_blue and not format_stores_blue(target_format):
+        force_blue = False
+        state.notes.append(f"{target_format} has no stored blue channel; blue override was omitted")
+
+    explicit_bc1 = options.compression == CompressionChoice.BC1 and is_bc1_format(target_format)
+    force_opaque = explicit_bc1 and options.bc1_alpha == BC1AlphaTreatment.OPAQUE
+    if force_blue and force_opaque:
+        swizzle = SwizzleMode.RG11
+    elif force_blue:
+        swizzle = SwizzleMode.RG1A
+    elif force_opaque:
+        swizzle = SwizzleMode.RGB1
+    else:
+        swizzle = SwizzleMode.NONE
+    state.slots[Slot.SWIZZLE] = int(swizzle)
+
+    bc_flags = BCFlag.UNIFORM if supports_uniform_bc_weighting(target_format) else BCFlag.NONE
+    if explicit_bc1 and options.bc1_alpha == BC1AlphaTreatment.DITHER:
+        bc_flags |= BCFlag.DITHER
+    state.slots[Slot.BC_FLAGS] = int(bc_flags)
+
+    threshold = AlphaThreshold.NONE
+    if explicit_bc1:
+        threshold = {
+            BC1AlphaTreatment.THRESHOLD_025: AlphaThreshold.VALUE_025,
+            BC1AlphaTreatment.THRESHOLD_050: AlphaThreshold.VALUE_050,
+            BC1AlphaTreatment.THRESHOLD_075: AlphaThreshold.VALUE_075,
+        }.get(options.bc1_alpha, AlphaThreshold.NONE)
+    state.slots[Slot.ALPHA_THRESHOLD] = int(threshold)
+
+    texconv_mips = mip_argument(options.mip_mode, metadata)
+    expected_mips = expected_mip_levels(options.mip_mode, metadata, output_width, output_height)
+    state.slots[Slot.TEXCONV_MIPS] = texconv_mips
+    state.slots[Slot.EXPECTED_MIPS] = expected_mips
+    state.slots[Slot.EXPECTED_ALPHA_MODE] = (
+        ALPHA_MODE_VALUES["Opaque"] if force_opaque else ALPHA_MODE_VALUES[metadata.alpha_mode]
+    )
+
+    problems = validate_resolved_state(state)
+    if problems:
+        state.status = FileStatus.INVALID_COMBINATION
+        state.reason = "; ".join(problems)
+
+
+def validate_resolved_state(state: FileState) -> list[str]:
+    problems: list[str] = []
+    required = RESOLVED_SLOTS
+    missing = [slot.name for slot in required if state.slots[slot] == UNSET]
+    if missing:
+        return [f"unresolved command slots: {', '.join(missing)}"]
+
+    metadata = state.metadata
+    if metadata is None:
+        return ["source metadata is unavailable"]
+    try:
+        target_format = format_name(state.slots[Slot.OUTPUT_FORMAT])
+    except RuntimeError as exc:
+        return [str(exc)]
+    if state.slots[Slot.OUTPUT_WIDTH] <= 0 or state.slots[Slot.OUTPUT_HEIGHT] <= 0:
+        problems.append("output dimensions must be positive")
+    if bool(state.slots[Slot.OUTPUT_SRGB]) != target_format.endswith("_SRGB"):
+        problems.append("output sRGB slot contradicts the target DXGI format")
+
+    try:
+        color_action = ColorAction(state.slots[Slot.COLOR_ACTION])
+    except ValueError:
+        problems.append(f"unknown color action {state.slots[Slot.COLOR_ACTION]}")
+        color_action = ColorAction.NONE
+    if color_action != ColorAction.NONE and not metadata.is_srgb:
+        problems.append("linearization was requested for an already-linear source")
+    if color_action != ColorAction.NONE and state.slots[Slot.OUTPUT_SRGB]:
+        problems.append("linearization cannot produce an sRGB-labelled output")
+    if color_action == ColorAction.REINTERPRET_LINEAR and metadata.format not in SRGB_TO_LINEAR_DXGI:
+        problems.append(f"{metadata.format} cannot be reinterpreted by patching its DX10 format tag")
+
+    try:
+        swizzle = SwizzleMode(state.slots[Slot.SWIZZLE])
+    except ValueError:
+        problems.append(f"unknown swizzle mode {state.slots[Slot.SWIZZLE]}")
+        swizzle = SwizzleMode.NONE
+    if swizzle in {SwizzleMode.RG1A, SwizzleMode.RG11} and not format_stores_blue(target_format):
+        problems.append(f"{target_format} cannot store the requested blue-channel swizzle")
+
+    flags = BCFlag(state.slots[Slot.BC_FLAGS])
+    known_flags = BCFlag.UNIFORM | BCFlag.DITHER
+    if int(flags) & ~int(known_flags):
+        problems.append(f"unknown BC flag bits {int(flags) & ~int(known_flags)}")
+    if flags & BCFlag.UNIFORM and not supports_uniform_bc_weighting(target_format):
+        problems.append("uniform BC weighting is unsupported by the target format")
+    explicit_bc1_dither = (
+        state.slots[Slot.REQUEST_COMPRESSION] == int(CompressionChoice.BC1)
+        and state.slots[Slot.REQUEST_BC1_ALPHA] == int(BC1AlphaTreatment.DITHER)
+    )
+    if flags & BCFlag.DITHER and (not is_bc1_format(target_format) or not explicit_bc1_dither):
+        problems.append("full-range alpha dithering is only valid for explicit BC1 output")
+
+    try:
+        threshold = AlphaThreshold(state.slots[Slot.ALPHA_THRESHOLD])
+    except ValueError:
+        problems.append(f"unknown alpha threshold {state.slots[Slot.ALPHA_THRESHOLD]}")
+        threshold = AlphaThreshold.NONE
+    if threshold != AlphaThreshold.NONE and not is_bc1_format(target_format):
+        problems.append("alpha threshold is only valid for BC1 output")
+    if state.slots[Slot.TEXCONV_MIPS] < 0 or state.slots[Slot.EXPECTED_MIPS] < 1:
+        problems.append("invalid mip settings")
+    return problems
+
+
+def build_texconv_command(
+    texconv: Path,
+    state: FileState,
+    conversion_source: Path,
+    staging: Path,
+    filter_name: str,
+) -> list[str | Path]:
+    problems = validate_resolved_state(state)
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    command: list[str | Path] = [
+        texconv,
+        "-nologo",
+        "-y",
+        "-w",
+        str(state.slots[Slot.OUTPUT_WIDTH]),
+        "-h",
+        str(state.slots[Slot.OUTPUT_HEIGHT]),
+        "-m",
+        str(state.slots[Slot.TEXCONV_MIPS]),
+        "-if",
+        filter_name,
+        "-dx10",
+        "-f",
+        format_name(state.slots[Slot.OUTPUT_FORMAT]),
+        "-o",
+        staging,
+    ]
+    if ColorAction(state.slots[Slot.COLOR_ACTION]) == ColorAction.CONVERT_TO_LINEAR:
+        command.append("-srgbi")
+    swizzle = SwizzleMode(state.slots[Slot.SWIZZLE])
+    swizzle_value = {
+        SwizzleMode.RGB1: "rgb1",
+        SwizzleMode.RG1A: "rg1a",
+        SwizzleMode.RG11: "rg11",
+    }.get(swizzle)
+    if swizzle_value:
+        command.extend(["--swizzle", swizzle_value])
+    threshold = AlphaThreshold(state.slots[Slot.ALPHA_THRESHOLD])
+    threshold_value = {
+        AlphaThreshold.VALUE_025: "0.25",
+        AlphaThreshold.VALUE_050: "0.5",
+        AlphaThreshold.VALUE_075: "0.75",
+    }.get(threshold)
+    if threshold_value:
+        command.extend(["-at", threshold_value])
+    flags = BCFlag(state.slots[Slot.BC_FLAGS])
+    flag_text = ("u" if flags & BCFlag.UNIFORM else "") + ("d" if flags & BCFlag.DITHER else "")
+    if flag_text:
+        command.extend(["-bc", flag_text])
+    command.extend(["--", conversion_source])
+    return command
 
 
 def prompt_conversion_confirmation(convert_count: int, ignored_count: int) -> bool:
@@ -461,33 +1040,31 @@ def prompt_staging_action(install_available: bool) -> int:
         return selected
 
 
-def validate_output(
-    source: TextureMetadata,
-    output: TextureMetadata,
-    output_width: int,
-    output_height: int,
-    target_format: str,
-    mip_mode: int,
-    expected_srgb: bool,
-) -> list[str]:
-    problems: list[str] = []
-    expected_mips = expected_mip_levels(mip_mode, source, output_width, output_height)
+def validate_output_for_state(state: FileState, output: TextureMetadata) -> list[str]:
+    metadata = state.metadata
+    if metadata is None:
+        return ["source metadata is unavailable"]
+    expected_alpha = ALPHA_MODE_NAMES.get(state.slots[Slot.EXPECTED_ALPHA_MODE])
+    if expected_alpha is None:
+        return [f"invalid expected alpha-mode code {state.slots[Slot.EXPECTED_ALPHA_MODE]}"]
     comparisons = [
-        ("width", output.width, output_width),
-        ("height", output.height, output_height),
-        ("format", output.format, target_format),
-        ("mip levels", output.mip_levels, expected_mips),
-        ("depth", output.depth, source.depth),
-        ("array size", output.array_size, source.array_size),
-        ("dimension", output.dimension, source.dimension),
-        ("alpha mode", output.alpha_mode, source.alpha_mode),
+        ("width", output.width, state.slots[Slot.OUTPUT_WIDTH]),
+        ("height", output.height, state.slots[Slot.OUTPUT_HEIGHT]),
+        ("format", output.format, format_name(state.slots[Slot.OUTPUT_FORMAT])),
+        ("mip levels", output.mip_levels, state.slots[Slot.EXPECTED_MIPS]),
+        ("depth", output.depth, state.slots[Slot.SOURCE_DEPTH]),
+        ("array size", output.array_size, state.slots[Slot.SOURCE_ARRAY_SIZE]),
+        ("dimension", output.dimension.upper(), CODE_TO_DIMENSION[state.slots[Slot.SOURCE_DIMENSION]]),
+        ("alpha mode", output.alpha_mode, expected_alpha),
     ]
-    for label, actual, expected in comparisons:
-        if actual != expected:
-            problems.append(f"{label}: expected {expected!r}, got {actual!r}")
-    if output.is_srgb != expected_srgb:
+    problems = [
+        f"{label}: expected {expected!r}, got {actual!r}"
+        for label, actual, expected in comparisons
+        if actual != expected
+    ]
+    if output.is_srgb != bool(state.slots[Slot.OUTPUT_SRGB]):
         problems.append(
-            f"color space: expected {'sRGB' if expected_srgb else 'linear'}, "
+            f"color space: expected {'sRGB' if state.slots[Slot.OUTPUT_SRGB] else 'linear'}, "
             f"got {'sRGB' if output.is_srgb else 'linear'}"
         )
     return problems
@@ -593,16 +1170,287 @@ def remove_staging_directories(staging_by_parent: dict[Path, Path]) -> None:
         shutil.rmtree(resolved_staging)
 
 
+def collect_source_files() -> list[Path]:
+    raw_inputs = list(sys.argv[1:])
+    if raw_inputs:
+        print(f"Received {len(raw_inputs)} path(s) from the script launch.")
+    while True:
+        print(
+            "\nAdd DDS files or folders by drag/drop or paste. Press Enter after each line.\n"
+            "When all paths have been added, press Enter on an empty line."
+        )
+        while True:
+            raw = input("> ")
+            if not raw.strip():
+                if raw_inputs:
+                    break
+                print("[ERROR] Add at least one DDS file or folder before finishing.")
+                continue
+            try:
+                added_inputs = split_windows_input(raw)
+            except (OSError, ValueError) as exc:
+                print(f"[ERROR] Could not parse input paths: {exc}")
+                continue
+            if not added_inputs:
+                print("[ERROR] No path was found on that line.")
+                continue
+            raw_inputs.extend(added_inputs)
+            print(f"Added {len(added_inputs)} path(s); {len(raw_inputs)} collected so far.")
+        files, warnings = collect_dds_files(raw_inputs)
+        for warning in warnings:
+            print(f"[WARNING] {warning}")
+        if files:
+            return files
+        print("[ERROR] None of the collected paths contained usable DDS files. Please try again.")
+        raw_inputs = []
+
+
+def inspect_sources(texdiag: Path, files: list[Path]) -> list[FileState]:
+    states: list[FileState] = []
+    print(f"\nFound {len(files)} DDS file(s).")
+    print("\nSource texture information:")
+    for index, source in enumerate(files, start=1):
+        try:
+            metadata = read_metadata(texdiag, source)
+            if "TYPELESS" in metadata.format:
+                raise RuntimeError(f"typeless format {metadata.format}; color space cannot be preserved safely")
+            shape_problem = unsupported_texture_shape(source, metadata)
+            if shape_problem:
+                raise RuntimeError(shape_problem)
+            state = create_file_state(source, metadata)
+            color_space = "sRGB" if metadata.is_srgb else "linear"
+            normal_status = "normal=yes" if is_normal_texture(source) else "normal=no"
+            print(
+                f"[{index}/{len(files)}] {source.name} | {metadata.width}x{metadata.height} | "
+                f"{metadata.format} | mips={metadata.mip_levels} | {color_space} | "
+                f"alpha={metadata.alpha_mode} | {normal_status}"
+            )
+        except (KeyError, RuntimeError) as exc:
+            state = create_file_state(source, None, str(exc))
+            print(f"[{index}/{len(files)}] [FAILED] {source.name}: {exc}")
+        states.append(state)
+    return states
+
+
+def display_round_settings(options: UserOptions, states: list[FileState], round_number: int) -> None:
+    target = "preserve each original size" if options.target_size == 0 else f"{options.target_size}x{options.target_size}"
+    print(f"\nConversion settings - round {round_number}:")
+    print(f"  Target:       {target}")
+    print(f"  Non-square:   {options.non_square_policy}")
+    print(f"  Small policy: {options.small_policy}")
+    print(f"  Compression:  {compression_label(int(options.compression))}")
+    print(f"  Normal maps:  {normal_texture_treatment_label(int(options.normal_treatment))}")
+    if options.bc1_alpha != BC1AlphaTreatment.NOT_APPLICABLE:
+        print(f"  BC1 alpha:    {bc1_transparency_label(int(options.bc1_alpha))}")
+    print(f"  sRGB mode:    {int(options.srgb_mode)}")
+    print("  Filter:       FANT (TRIANGLE fallback if DirectXTex rejects FANT)")
+    print(f"  Mipmap mode:  {options.mip_mode}")
+    counts = {status: sum(state.status == status for state in states) for status in FileStatus}
+    print(f"  Valid:        {counts[FileStatus.ACTIVE]}")
+    print(f"  Policy skip:  {counts[FileStatus.POLICY_SKIPPED]}")
+    print(f"  Invalid:      {counts[FileStatus.INVALID_COMBINATION]}")
+    for state in states:
+        for note in state.notes:
+            print(f"  [NOTE] {state.path.name}: {note}")
+        if state.status in {FileStatus.POLICY_SKIPPED, FileStatus.INVALID_COMBINATION}:
+            print(f"  [{state.status.name}] {state.path.name}: {state.reason}")
+
+
+def stage_round(
+    texconv: Path,
+    texdiag: Path,
+    states: list[FileState],
+    options: UserOptions,
+    round_number: int,
+) -> tuple[dict[Path, Path], RunLog]:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    size_label = "OriginalSize" if options.target_size == 0 else str(options.target_size)
+    format_label = compression_label(int(options.compression))
+    staging_by_parent: dict[Path, Path] = {}
+    log = RunLog(console=False)
+    log.write(f"ResizeDDS round {round_number}: {datetime.now().isoformat(timespec='seconds')}")
+    for state in states:
+        if state.status != FileStatus.ACTIVE:
+            log.write(f"[{state.status.name}] {state.path}: {state.reason}")
+
+    valid_states = [state for state in states if state.status == FileStatus.ACTIVE]
+    progress = BatchProgress(len(valid_states))
+    if valid_states:
+        print("", flush=True)
+    for index, state in enumerate(valid_states, start=1):
+        metadata = state.metadata
+        assert metadata is not None
+        source = state.path
+        progress.update(source)
+        staging = staging_by_parent.get(source.parent)
+        if staging is None:
+            try:
+                staging = unique_staging_directory(
+                    source.parent, size_label, f"{format_label}_R{round_number}", timestamp
+                )
+            except OSError as exc:
+                state.status = FileStatus.CONVERSION_FAILED
+                state.reason = f"could not create staging directory: {exc}"
+                log.write(f"[FAILED] {source}: {state.reason}")
+                progress.failure(source)
+                continue
+            staging_by_parent[source.parent] = staging
+            log.write(f"Staging directory: {staging}")
+
+        log.write("")
+        log.write(
+            f"[{index}/{len(valid_states)}] {source.name}: "
+            f"{metadata.width}x{metadata.height} {metadata.format} -> "
+            f"{state.slots[Slot.OUTPUT_WIDTH]}x{state.slots[Slot.OUTPUT_HEIGHT]} "
+            f"{format_name(state.slots[Slot.OUTPUT_FORMAT])}"
+        )
+        for note in state.notes:
+            log.write(f"  [NOTE] {note}")
+
+        conversion_source = source
+        reinterpret_directory: Path | None = None
+        if ColorAction(state.slots[Slot.COLOR_ACTION]) == ColorAction.REINTERPRET_LINEAR:
+            try:
+                conversion_source, reinterpret_directory = create_linear_interpretation_copy(
+                    source, staging, metadata.format
+                )
+                log.write(f"  Reinterpreting {metadata.format} as linear without changing color values.")
+            except (OSError, RuntimeError) as exc:
+                state.status = FileStatus.CONVERSION_FAILED
+                state.reason = f"could not prepare linear reinterpretation: {exc}"
+                log.write(f"  [FAILED] {state.reason}")
+                progress.failure(source)
+                continue
+
+        result: subprocess.CompletedProcess[str] | None = None
+        generated: Path | None = None
+        used_filter = ""
+        try:
+            for filter_name in ("FANT", "TRIANGLE"):
+                command = build_texconv_command(texconv, state, conversion_source, staging, filter_name)
+                result = run_command(command)
+                for line in result.stdout.strip().splitlines():
+                    log.write(f"  {line}")
+                for line in result.stderr.strip().splitlines():
+                    log.write(f"  {line}")
+                generated = find_generated_dds(staging, source)
+                if result.returncode == 0 and generated is not None:
+                    used_filter = filter_name
+                    break
+                if generated:
+                    quarantine_failed_output(generated)
+                    generated = None
+                if filter_name == "FANT":
+                    log.write("  [RETRY] FANT was rejected; retrying with TRIANGLE.")
+        except RuntimeError as exc:
+            state.status = FileStatus.INVALID_COMBINATION
+            state.reason = str(exc)
+            log.write(f"  [INVALID COMBINATION] {exc}")
+        finally:
+            if reinterpret_directory is not None:
+                shutil.rmtree(reinterpret_directory, ignore_errors=True)
+
+        if state.status == FileStatus.INVALID_COMBINATION:
+            progress.failure(source)
+            continue
+        if result is None or result.returncode != 0 or generated is None:
+            exit_code = result.returncode if result is not None else "not run"
+            state.status = FileStatus.CONVERSION_FAILED
+            state.reason = f"texconv failed with exit code {exit_code}"
+            if generated is None:
+                state.reason += "; expected output file was not found"
+            log.write(f"  [FAILED] {state.reason}")
+            progress.failure(source)
+            continue
+
+        try:
+            expected_alpha = ALPHA_MODE_NAMES[state.slots[Slot.EXPECTED_ALPHA_MODE]]
+            restore_alpha_mode_metadata(generated, expected_alpha)
+            output_metadata = read_metadata(texdiag, generated)
+            problems = validate_output_for_state(state, output_metadata)
+            if problems:
+                raise RuntimeError("; ".join(problems))
+        except (KeyError, RuntimeError) as exc:
+            state.status = FileStatus.CONVERSION_FAILED
+            state.reason = f"validation failed: {exc}"
+            log.write(f"  [FAILED VALIDATION] {exc}")
+            quarantine_failed_output(generated)
+            progress.failure(source)
+            continue
+
+        state.status = FileStatus.STAGED
+        state.staged = generated
+        state.output_metadata = output_metadata
+        log.write(
+            f"  [OK] {output_metadata.width}x{output_metadata.height}, {output_metadata.format}, "
+            f"{output_metadata.mip_levels} mip(s), alpha={output_metadata.alpha_mode}, filter={used_filter}"
+        )
+        progress.success(source)
+
+    progress.finish()
+    log.save_to(staging_by_parent.values())
+    return staging_by_parent, log
+
+
+def finalize_round(
+    states: list[FileState],
+    staging_by_parent: dict[Path, Path],
+    log: RunLog,
+    texdiag: Path,
+) -> int:
+    staged_states = [state for state in states if state.status == FileStatus.STAGED]
+    action = prompt_staging_action(bool(staged_states))
+    if action == 0:
+        for state in staged_states:
+            state.status = FileStatus.KEPT_STAGING
+        log.write("Staging kept; originals were not changed.")
+        log.save_to(staging_by_parent.values())
+        print("Staged files were kept. Originals remain unchanged.")
+        return 0
+    if action == 2:
+        remove_staging_directories(staging_by_parent)
+        print("This round's staging was deleted; every file from the round will be retried.")
+        return 2
+
+    install_failures: list[FileState] = []
+    progress = BatchProgress(len(staged_states))
+    if staged_states:
+        print("", flush=True)
+    for state in staged_states:
+        assert state.metadata is not None and state.staged is not None and state.output_metadata is not None
+        job = TextureJob(state.path, state.metadata, state.staged, state.output_metadata)
+        progress.update(state.path)
+        try:
+            install_staged_job(job, texdiag)
+            state.status = FileStatus.INSTALLED
+            log.write(f"[INSTALLED] {state.path}")
+            progress.success(state.path)
+        except (OSError, RuntimeError) as exc:
+            state.status = FileStatus.INSTALL_FAILED
+            state.reason = str(exc)
+            install_failures.append(state)
+            log.write(f"[INSTALL FAILED] {state.path}: {exc}")
+            progress.failure(state.path)
+    progress.finish()
+    log.save_to(staging_by_parent.values())
+    if install_failures:
+        for state in install_failures:
+            print(f"[INSTALL_FAILED] {state.path}: {state.reason}")
+        print("Some replacements failed, so this round's staging was kept for recovery.")
+    else:
+        remove_staging_directories(staging_by_parent)
+        print("All replacements succeeded; this round's staging was deleted.")
+    return 1
+
+
 def main() -> int:
     print("=" * 62)
     print("DDS Batch Downsizer - Microsoft DirectXTex")
     print("=" * 62)
     print("Quick use:")
-    print("  1. Drag DDS files or a folder here; folders are not recursive.")
-    print("  2. Review source info, choose conversion options, then enter 1 to stage outputs.")
-    print("  3. Choose the final 0/1/2 action after validated outputs are staged.")
-    print("  See README.md beside this script for option details.\n")
-
+    print("  1. Add DDS files/folders one line at a time; finish with an empty line.")
+    print("  2. Each round applies one option set to all currently active files.")
+    print("  3. Skipped, invalid, and failed files can be retried with new options.\n")
     try:
         texconv = find_directxtex_tool("texconv")
         texdiag = find_directxtex_tool("texdiag")
@@ -610,332 +1458,96 @@ def main() -> int:
         print(f"[ERROR] {exc}")
         return 2
 
-    raw_inputs = sys.argv[1:]
-    while True:
-        if not raw_inputs:
-            raw = input("Drag DDS file(s) or a folder here, then press Enter:\n> ")
-            try:
-                raw_inputs = split_windows_input(raw)
-            except (OSError, ValueError) as exc:
-                print(f"[ERROR] Could not parse input paths: {exc}")
-                raw_inputs = []
-                continue
-
-        files, discovery_warnings = collect_dds_files(raw_inputs)
-        for warning in discovery_warnings:
-            print(f"[WARNING] {warning}")
-        if files:
-            break
-        print("[ERROR] No DDS files were selected. Please try again.\n")
-        raw_inputs = []
-
-    print(f"\nFound {len(files)} DDS file(s).")
-
-    inspected: list[tuple[Path, TextureMetadata]] = []
-    inspection_failures: list[tuple[Path, str]] = []
-    print("\nSource texture information:")
-    for index, source in enumerate(files, start=1):
-        try:
-            metadata = read_metadata(texdiag, source)
-            if "TYPELESS" in metadata.format:
-                raise RuntimeError(f"typeless format {metadata.format}; color space cannot be preserved safely")
-            inspected.append((source, metadata))
-            color_space = "sRGB" if metadata.is_srgb else "linear"
-            mip_status = f"yes ({metadata.mip_levels})" if metadata.mip_levels > 1 else "no (1)"
-            print(
-                f"[{index}/{len(files)}] {source.name}\n"
-                f"    size={metadata.width}x{metadata.height}, mip-chain={mip_status}, "
-                f"format={metadata.format}, color-space={color_space}, alpha={metadata.alpha_mode}, "
-                f"type={metadata.dimension}, array={metadata.array_size}, depth={metadata.depth}"
-            )
-        except RuntimeError as exc:
-            inspection_failures.append((source, str(exc)))
-            print(f"[{index}/{len(files)}] [FAILED] {source.name}: {exc}")
-
-    if not inspected:
+    states = inspect_sources(texdiag, collect_source_files())
+    if not any(state.status == FileStatus.ACTIVE for state in states):
         print("[ERROR] None of the selected textures could be inspected safely.")
         return 1
 
-    target_size = prompt_resolution()
-    non_square_policy = prompt_non_square_policy(target_size)
-    small_policy = prompt_small_texture_policy()
-    compression = prompt_compression()
-    srgb_mode = prompt_srgb_mode()
-    mip_mode = prompt_mipmap_mode()
+    round_number = 1
+    while True:
+        round_states = [state for state in states if state.status == FileStatus.ACTIVE]
+        if not round_states:
+            break
+        print(f"\n{'=' * 62}\nROUND {round_number}: {len(round_states)} active file(s)")
+        options = prompt_user_options()
+        for state in round_states:
+            resolve_file_state(state, options)
+        display_round_settings(options, round_states, round_number)
 
-    selected: list[PlannedTexture] = []
-    ignored: list[tuple[Path, str]] = list(inspection_failures)
-    for source, metadata in inspected:
-        is_non_square = metadata.width != metadata.height
-        if is_non_square and non_square_policy == 0:
-            ignored.append((source, "non-square source and non-square policy is 0"))
-            continue
+        valid_count = sum(state.status == FileStatus.ACTIVE for state in round_states)
+        ignored_count = len(round_states) - valid_count
+        if not prompt_conversion_confirmation(valid_count, ignored_count):
+            print("Conversion aborted. No new staging folder was created.")
+            break
 
-        is_small_or_equal = target_size != 0 and metadata.width <= target_size and metadata.height <= target_size
-        if not is_non_square and is_small_or_equal and small_policy == 0:
-            ignored.append((source, "at or below the target and smaller/equal policy is 0"))
-            continue
+        staging_by_parent: dict[Path, Path] = {}
+        log = RunLog()
+        if valid_count:
+            staging_by_parent, log = stage_round(texconv, texdiag, round_states, options, round_number)
 
-        try:
-            target_format = output_format(compression, metadata, srgb_mode)
-        except RuntimeError as exc:
-            ignored.append((source, str(exc)))
-            continue
+        staged_count = sum(state.status == FileStatus.STAGED for state in round_states)
+        print(f"\nRound {round_number} complete: {staged_count} staged")
+        if staged_count:
+            for staging in staging_by_parent.values():
+                print(f"Staged output: {staging}", flush=True)
+        for status in (FileStatus.POLICY_SKIPPED, FileStatus.INVALID_COMBINATION, FileStatus.CONVERSION_FAILED):
+            count = sum(state.status == status for state in round_states)
+            if count:
+                print(f"  {status.name}: {count}")
 
-        output_width, output_height = planned_dimensions(
-            metadata, target_size, small_policy, non_square_policy
-        )
-        selected.append(
-            PlannedTexture(source, metadata, output_width, output_height, target_format)
-        )
-
-    print("\nConversion settings:")
-    target_description = "preserve each original size" if target_size == 0 else f"{target_size}x{target_size}"
-    print(f"  Target:       {target_description}")
-    print(f"  Non-square:   {non_square_policy}")
-    print(f"  Small policy: {small_policy}")
-    print(f"  Compression:  {compression_label(compression)}")
-    print(f"  sRGB mode:    {srgb_mode}")
-    print("  Filter:       FANT (TRIANGLE fallback if DirectXTex rejects FANT)")
-    print(f"  Mipmap mode:  {mip_mode}")
-    if target_size == 0:
-        print("  Note:         Small-image policy is inactive because target size is 0")
-
-    if ignored:
-        reason_counts: dict[str, int] = {}
-        for _, reason in ignored:
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-        print("\nIgnored breakdown:")
-        for reason, count in reason_counts.items():
-            print(f"  {count}: {reason}")
-
-    if not prompt_conversion_confirmation(len(selected), len(ignored)):
-        print("\nConversion aborted. No staging folder was created and no originals were changed.")
-        return 0
-
-    if not selected:
-        print("\nNothing needs to be processed.")
-        return 0
-
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    size_label = "OriginalSize" if target_size == 0 else str(target_size)
-    format_label = compression_label(compression)
-    staging_by_parent: dict[Path, Path] = {}
-    log = RunLog()
-    log.write(f"ResizeDDS run: {datetime.now().isoformat(timespec='seconds')}")
-    log.write(
-        f"Target: {target_description}; small policy: {small_policy}; "
-        f"non-square policy: {non_square_policy}; compression: {format_label}; "
-        f"sRGB mode: {srgb_mode}; mip mode: {mip_mode}"
-    )
-    for source, reason in ignored:
-        log.write(f"[IGNORED] {source}: {reason}")
-    log.write("")
-
-    jobs: list[TextureJob] = []
-    conversion_failures: list[tuple[Path, str]] = []
-    for index, planned in enumerate(selected, start=1):
-        source = planned.source
-        source_metadata = planned.source_metadata
-        output_width = planned.output_width
-        output_height = planned.output_height
-        target_format = planned.target_format
-        staging = staging_by_parent.get(source.parent)
-        if staging is None:
-            try:
-                staging = unique_staging_directory(source.parent, size_label, format_label, timestamp)
-            except OSError as exc:
-                reason = f"could not create staging directory: {exc}"
-                conversion_failures.append((source, reason))
-                log.write(f"[FAILED] {source}: {reason}")
+        if staged_count:
+            final_action = finalize_round(round_states, staging_by_parent, log, texdiag)
+            if final_action == 2:
+                for state in round_states:
+                    reset_for_retry(state)
+                round_number += 1
                 continue
-            staging_by_parent[source.parent] = staging
-            log.write(f"Staging directory: {staging}")
+        elif staging_by_parent:
+            log.save_to(staging_by_parent.values())
+            remove_staging_directories(staging_by_parent)
+            print("No validated outputs were produced; empty/failed staging was removed.")
 
-        mips = mip_argument(mip_mode, source_metadata)
-        log.write("")
-        log.write(
-            f"[{index}/{len(selected)}] {source.name}: "
-            f"{source_metadata.width}x{source_metadata.height} {source_metadata.format} "
-            f"-> {output_width}x{output_height} {target_format}"
-        )
-        conversion_source = source
-        reinterpret_directory: Path | None = None
-        if srgb_mode == 1 and source_metadata.is_srgb:
-            try:
-                conversion_source, reinterpret_directory = create_linear_interpretation_copy(
-                    source, staging, source_metadata.format
-                )
-                log.write(f"  Reinterpreting {source_metadata.format} as linear without changing color values.")
-            except (OSError, RuntimeError) as exc:
-                reason = f"could not prepare linear reinterpretation: {exc}"
-                conversion_failures.append((source, reason))
-                log.write(f"  [FAILED] {reason}")
-                continue
+        leftovers = [
+            state
+            for state in round_states
+            if state.status
+            in {FileStatus.POLICY_SKIPPED, FileStatus.INVALID_COMBINATION, FileStatus.CONVERSION_FAILED}
+        ]
+        if not leftovers:
+            break
+        print("\nFiles not converted in this round:")
+        for state in leftovers:
+            print(f"  [{state.status.name}] {state.path.name}: {state.reason}")
+        if not prompt_retry_leftovers():
+            print("Leaving these files unchanged.")
+            break
+        for state in leftovers:
+            reset_for_retry(state)
+        round_number += 1
 
-        result: subprocess.CompletedProcess[str] | None = None
-        generated: Path | None = None
-        used_filter = ""
-        for filter_name in ("FANT", "TRIANGLE"):
-            command: list[str | Path] = [
-                texconv,
-                "-nologo",
-                "-y",
-                "-w",
-                str(output_width),
-                "-h",
-                str(output_height),
-                "-m",
-                str(mips),
-                "-if",
-                filter_name,
-                "-dx10",
-                "-f",
-                target_format,
-                "-o",
-                staging,
-            ]
-            if srgb_mode == 2 and source_metadata.is_srgb:
-                command.append("-srgbi")
-            if supports_uniform_bc_weighting(target_format):
-                # DirectXTex supports uniform instead of perceptual RGB error
-                # weighting for BC1-BC3 (including their legacy aliases).
-                command.extend(["-bc", "u"])
-            command.extend(["--", conversion_source])
-            result = run_command(command)
-            if result.stdout.strip():
-                for line in result.stdout.strip().splitlines():
-                    log.write(f"  {line}")
-            if result.stderr.strip():
-                for line in result.stderr.strip().splitlines():
-                    log.write(f"  {line}")
-
-            generated = find_generated_dds(staging, source)
-            if result.returncode == 0 and generated is not None:
-                used_filter = filter_name
-                break
-            if generated:
-                quarantine_failed_output(generated)
-                generated = None
-            if filter_name == "FANT":
-                log.write("  [RETRY] FANT was rejected; retrying with the finite low-pass TRIANGLE filter.")
-
-        if reinterpret_directory is not None:
-            shutil.rmtree(reinterpret_directory, ignore_errors=True)
-
-        assert result is not None
-        if result.returncode != 0 or generated is None:
-            reason = f"texconv failed with exit code {result.returncode}"
-            if generated is None:
-                reason += "; expected output file was not found"
-            conversion_failures.append((source, reason))
-            log.write(f"  [FAILED] {reason}")
-            if generated:
-                quarantine_failed_output(generated)
-            continue
-
-        try:
-            restore_alpha_mode_metadata(generated, source_metadata.alpha_mode)
-            output_metadata = read_metadata(texdiag, generated)
-            problems = validate_output(
-                source_metadata,
-                output_metadata,
-                output_width,
-                output_height,
-                target_format,
-                mip_mode,
-                source_metadata.is_srgb and srgb_mode == 0,
-            )
-            if problems:
-                raise RuntimeError("; ".join(problems))
-        except RuntimeError as exc:
-            conversion_failures.append((source, str(exc)))
-            log.write(f"  [FAILED VALIDATION] {exc}")
-            quarantine_failed_output(generated)
-            continue
-
-        jobs.append(TextureJob(source, source_metadata, generated, output_metadata))
-        log.write(
-            f"  [OK] {output_metadata.width}x{output_metadata.height}, "
-            f"{output_metadata.format}, {output_metadata.mip_levels} mip(s), "
-            f"alpha={output_metadata.alpha_mode}, filter={used_filter}"
-        )
-
-    log.write("")
-    log.write(
-        f"Staging finished: {len(jobs)} successful, {len(ignored)} ignored, "
-        f"{len(conversion_failures)} failed."
-    )
-    log.save_to(staging_by_parent.values())
-
-    print("\n" + "=" * 62)
-    print(
-        f"STAGING COMPLETE: {len(jobs)} successful, {len(ignored)} ignored, "
-        f"{len(conversion_failures)} failed"
-    )
-    for staging in staging_by_parent.values():
-        print(f"Staged output: {staging}")
-    if conversion_failures:
-        print("\nFailures:")
-        for source, reason in conversion_failures:
-            print(f"  {source.name}: {reason}")
-
-    print("\nOriginal files have NOT been changed.")
-    if not jobs:
-        print("No validated outputs are available to install.")
-
-    action = prompt_staging_action(bool(jobs))
-    if action == 0:
-        log.write("Staging kept; originals were not changed.")
-        log.save_to(staging_by_parent.values())
-        print("Staged files were kept. Originals remain unchanged.")
-        return 0 if not conversion_failures else 1
-
-    if action == 2:
-        print("Deleting this run's staging folder(s)...")
-        remove_staging_directories(staging_by_parent)
-        print("Staging deleted. Restarting from the beginning.\n")
-        return RESTART_REQUESTED
-
-    installed = 0
-    install_failures: list[tuple[Path, str]] = []
-    print("\nInstalling validated outputs...")
-    for job in jobs:
-        try:
-            install_staged_job(job, texdiag)
-            installed += 1
-            log.write(f"[INSTALLED] {job.source}")
-            print(f"[OK] {job.source.name}")
-        except (OSError, RuntimeError) as exc:
-            install_failures.append((job.source, str(exc)))
-            log.write(f"[INSTALL FAILED] {job.source}: {exc}")
-            print(f"[FAILED] {job.source.name}: {exc}")
-
-    log.write(f"Install finished: {installed} installed, {len(install_failures)} failed.")
-    log.save_to(staging_by_parent.values())
-    print(f"\nINSTALL COMPLETE: {installed} installed, {len(install_failures)} failed")
-    if install_failures:
-        print("Some replacements failed, so the staging folder was kept for recovery.")
-    else:
-        remove_staging_directories(staging_by_parent)
-        print("All replacements succeeded; the staging folder was deleted.")
-    return 0 if not conversion_failures and not install_failures else 1
+    inspection_failures = [state for state in states if state.status == FileStatus.INSPECTION_FAILED]
+    if inspection_failures:
+        print("\nInspection failures (not retryable with conversion options):")
+        for state in inspection_failures:
+            print(f"  {state.path.name}: {state.reason}")
+    hard_failures = {
+        FileStatus.INVALID_COMBINATION,
+        FileStatus.CONVERSION_FAILED,
+        FileStatus.INSTALL_FAILED,
+        FileStatus.INSPECTION_FAILED,
+    }
+    return 1 if any(state.status in hard_failures for state in states) else 0
 
 
 def run_and_pause() -> int:
-    while True:
-        try:
-            exit_code = main()
-        except KeyboardInterrupt:
-            print("\nCancelled. Any originals not explicitly installed remain unchanged.")
-            exit_code = 130
-        except Exception as exc:  # Keep unexpected failures visible when launched from Explorer.
-            print(f"\n[UNEXPECTED ERROR] {exc}")
-            exit_code = 1
-
-        if exit_code == RESTART_REQUESTED:
-            continue
-        break
+    try:
+        exit_code = main()
+    except KeyboardInterrupt:
+        print("\nCancelled. Any originals not explicitly installed remain unchanged.")
+        exit_code = 130
+    except Exception as exc:  # Keep unexpected failures visible when launched from Explorer.
+        print(f"\n[UNEXPECTED ERROR] {exc}")
+        exit_code = 1
 
     if sys.stdin.isatty():
         try:
