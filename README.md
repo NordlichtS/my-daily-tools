@@ -91,7 +91,7 @@ Important options:
 - Target size `0` preserves each source's dimensions.
 - Compression `0` preserves each source's existing format, including existing BC2/BC4/BC5/BC6 files.
 - Non-square mode `2` chooses the largest power-of-two width and height that do not exceed either the source dimensions or target-size cap.
-- sRGB mode `0` preserves color-space labels, `1` treats stored values as linear, and `2` converts sRGB values to linear output.
+- sRGB mode `0` preserves color-space labels, `1` treats stored values as linear, `2` converts sRGB values to linear output, and `3` assumes the input values are sRGB and writes sRGB output. Mode `3` is intended for sRGB textures wrongly tagged as linear; it enables gamma-correct filtering without converting the final values to linear. It does not apply to BC4, BC5, or BC6, which remain linear.
 - Mipmap mode `0` preserves whether each source had a chain, `1` keeps only the biggest mip level, and `2` generates full chains for all.
 
 Compression reference ([Microsoft Direct3D 11 documentation](https://learn.microsoft.com/en-us/windows/win32/direct3d11/texture-block-compression-in-direct3d-11)):
