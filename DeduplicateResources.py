@@ -664,6 +664,44 @@ def append_manual_report(
         stream.write("\n".join(lines) + "\n")
 
 
+def final_reference_check(text_path: Path, resource_folder: Path) -> bool:
+    """Ensure selected-folder filename assignments resolve before the tool exits."""
+    print("\nRunning final selected-folder reference check...")
+    try:
+        document = decode_text_file(text_path)
+        resources = scan_resources(resource_folder, document)
+        resources = [resource for resource in resources if resource.path != text_path]
+        _, missing = collect_reference_inventory(
+            document,
+            resources,
+            resource_folder,
+            record=True,
+        )
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        print(f"[FINAL CHECK FAILED] Could not validate the current text and resources: {exc}")
+        return False
+
+    referenced_occurrences = sum(resource.reference_count for resource in resources)
+    if missing:
+        counts = Counter(missing)
+        print(
+            f"[FINAL CHECK FAILED] {sum(counts.values())} filename assignment(s) "
+            "point to missing files in the selected folder:"
+        )
+        for path_value in sorted(counts, key=lambda value: (value.casefold(), value)):
+            suffix = f" ({counts[path_value]} occurrences)" if counts[path_value] > 1 else ""
+            print(f"  {path_value}{suffix}")
+        print("References to other relative folders were intentionally not checked.")
+        return False
+
+    print(
+        f"[FINAL CHECK PASSED] All {referenced_occurrences} selected-folder filename "
+        "assignment(s) resolve to existing files."
+    )
+    print("References to other relative folders were intentionally not checked.")
+    return True
+
+
 def run_manual_mode(
     document: TextDocument,
     resource_folder: Path,
@@ -673,7 +711,7 @@ def run_manual_mode(
 ) -> int:
     if not prompt_manual_mode():
         print("Manual mode finished.")
-        return 0
+        return 0 if final_reference_check(document.path, resource_folder) else 1
 
     completed_groups = 0
     moved_total = 0
@@ -832,6 +870,10 @@ def run_manual_mode(
         )
         if not prompt_manual_mode():
             break
+
+    final_check_passed = final_reference_check(document.path, resource_folder)
+    if not final_check_passed:
+        failure_total += 1
 
     print("\nManual mode summary:")
     print(f"  Groups completed:  {completed_groups}")
